@@ -1,305 +1,428 @@
-#include <elapsedMillis.h> //load the library
+#include <elapsedMillis.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <FastLED.h>
 #include <Servo.h>
-#define LED_PIN     7
-#define NUM_LEDS    1
-#include "RTClib.h"
-#include <TM1637Display.h>
-
-#define CLK 6
-#define DIO 5
-
-RTC_DS3231 rtc;
-TM1637Display display = TM1637Display(CLK, DIO);
-
-CRGB leds[NUM_LEDS];
-Servo servo;
-LiquidCrystal_I2C lcd = LiquidCrystal_I2C(0x27, 20, 4);
-elapsedMillis sensors;//Create an Instance
-elapsedMillis staty;//Create an Instance
-elapsedMillis buttonms;//Create an Instance
-elapsedMillis lcdms;//Create an Instance
-
-
-int red_light_pin= 11;
-int green_light_pin = 10;
-int blue_light_pin = 9;
-
-
-const int buttonPin = 3;
-int counter = 0;
-float temp;
-float humidity;
-int pressure;
-int particles;
-int srparticles;
-int opary;
-
-//-------------------DHT-------------------
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
-#define DHTPIN 2
-#define DHTTYPE    DHT22
-DHT_Unified dht(DHTPIN, DHTTYPE);
-//---------------DUST-------------------
 #include <GP2YDustSensor.h>
-const uint8_t SHARP_LED_PIN = 12;   // Sharp Dust/particle sensor Led Pin
-const uint8_t SHARP_VO_PIN = A3;    // Sharp Dust/particle analog out pin used for reading
-GP2YDustSensor dustSensor(GP2YDustSensorType::GP2Y1014AU0F, SHARP_LED_PIN, SHARP_VO_PIN);
-
-//-----------BAR-----------------
-#include <Adafruit_Sensor.h>
 #include <Adafruit_BMP085_U.h>
+#include "RTClib.h"
+#include <TM1637Display.h>
+
+// ==================== PIN DEFINITIONS ====================
+#define LED_PIN           7
+#define NUM_LEDS          1
+#define CLK_PIN           6
+#define DIO_PIN           5
+#define BUTTON_PIN        3
+#define DHT_PIN           2
+#define RED_PIN           11
+#define GREEN_PIN         10
+#define BLUE_PIN          9
+#define SERVO_PIN         8
+#define DUST_LED_PIN      12
+#define DUST_ANALOG_PIN   A3
+#define CO2_ANALOG_PIN    A0
+
+// ==================== AIR QUALITY THRESHOLDS ====================
+#define AQ_EXCELLENT      25
+#define AQ_GOOD           70
+#define AQ_MODERATE       130
+#define AQ_POOR           180
+
+// ==================== TIMING CONSTANTS ====================
+#define SENSOR_UPDATE_MS      1000
+#define STATUS_UPDATE_MS      500
+#define LCD_UPDATE_MS         500
+#define BUTTON_DEBOUNCE_MS    750
+
+// ==================== DISPLAY MODES ====================
+#define MODE_PARTICLES    0
+#define MODE_TEMPERATURE  1
+#define MODE_HUMIDITY     2
+#define MODE_PRESSURE     3
+#define MODE_VAPOR        4
+#define MODE_COUNT        5
+
+// ==================== LCD ADDRESS ====================
+#define LCD_ADDRESS       0x27  // Change if your LCD has different address
+
+// ==================== SENSOR VALIDATION ====================
+#define TEMP_MIN          -40.0
+#define TEMP_MAX          80.0
+#define HUMIDITY_MIN      0.0
+#define HUMIDITY_MAX      100.0
+#define PRESSURE_MIN      800.0
+#define PRESSURE_MAX      1200.0
+
+// ==================== GLOBAL OBJECTS ====================
+RTC_DS3231 rtc;
+TM1637Display display = TM1637Display(CLK_PIN, DIO_PIN);
+CRGB leds[NUM_LEDS];
+Servo servo;
+LiquidCrystal_I2C lcd = LiquidCrystal_I2C(LCD_ADDRESS, 20, 4);
+DHT_Unified dht(DHT_PIN, DHT22);
+GP2YDustSensor dustSensor(GP2YDustSensorType::GP2Y1014AU0F, DUST_LED_PIN, DUST_ANALOG_PIN);
 Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(10085);
 
-int sensorValue;
+// ==================== TIMING VARIABLES ====================
+elapsedMillis sensorTimer;
+elapsedMillis statusTimer;
+elapsedMillis lcdTimer;
+elapsedMillis buttonTimer;
 
+// ==================== STATE VARIABLES ====================
+int displayMode = MODE_PARTICLES;
+bool buttonPressed = false;
+bool lastButtonState = LOW;
 
+// ==================== SENSOR DATA ====================
+struct SensorData {
+  float temperature;
+  float humidity;
+  float pressure;
+  int particles;
+  int avgParticles;
+  int vaporConcentration;
+  bool valid;
+} sensorData = {0, 0, 0, 0, 0, 0, false};
 
+// ==================== FUNCTION PROTOTYPES ====================
+void initializeSensors();
+void handleButton();
+void updateSensors();
+void updateAirQualityIndicators();
+void updateLCD();
+void updateTimeDisplay();
+void setRGBColor(int red, int green, int blue);
+float validateTemperature(float temp);
+float validateHumidity(float humidity);
+float validatePressure(float pressure);
+const char* getAirQualityText(int particles);
 
-
-
+// ==================== SETUP ====================
 void setup() {
   Serial.begin(9600);
-  servo.attach(8);
+  
+  // Pin modes
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(RED_PIN, OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN, OUTPUT);
+  
+  // Servo initialization
+  servo.attach(SERVO_PIN);
   servo.write(15);
-
+  
+  // FastLED initialization
   FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
-  pinMode(buttonPin, INPUT);
-  //-----------------DHT------------------
+  
+  // LCD initialization
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Initializing...");
+  
+  // Initialize all sensors
+  initializeSensors();
+  
+  // RTC initialization
+  if (!rtc.begin()) {
+    Serial.println("ERROR: RTC not found!");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("RTC ERROR!");
+    while (1);
+  }
+  
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, setting time...");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  
+  // 7-segment display initialization
+  display.setBrightness(5);
+  display.clear();
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Ready!");
+  delay(1000);
+  lcd.clear();
+  
+  Serial.println("System initialized successfully");
+}
+
+// ==================== MAIN LOOP ====================
+void loop() {
+  handleButton();
+  
+  if (sensorTimer >= SENSOR_UPDATE_MS) {
+    updateSensors();
+    sensorTimer = 0;
+  }
+  
+  if (statusTimer >= STATUS_UPDATE_MS) {
+    updateAirQualityIndicators();
+    statusTimer = 0;
+  }
+  
+  if (lcdTimer >= LCD_UPDATE_MS) {
+    updateLCD();
+    lcdTimer = 0;
+  }
+  
+  updateTimeDisplay();
+}
+
+// ==================== INITIALIZATION ====================
+void initializeSensors() {
+  // DHT sensor
   dht.begin();
-  // Print temperature sensor details.
   sensor_t sensor;
   dht.temperature().getSensor(&sensor);
   dht.humidity().getSensor(&sensor);
-
-  //-----------------LCD-------------------
-  lcd.init();
-  lcd.backlight();
-
-  //------------------DUST----------------
-  //dustSensor.setBaseline(0.4); // set no dust voltage according to your own experiments
-  //dustSensor.setCalibrationFactor(1.1); // calibrate against precision instrument
+  Serial.println("DHT22 initialized");
+  
+  // Dust sensor
   dustSensor.begin();
-
-  //-------------------BAR----------------
-  bmp.begin();
-
-  //--------------------------------------
-  pinMode(red_light_pin, OUTPUT);
-  pinMode(green_light_pin, OUTPUT);
-  pinMode(blue_light_pin, OUTPUT);
-
-if (! rtc.begin()) {
-    Serial.println("Couldn't find RTC");
-    while (1);
+  Serial.println("Dust sensor initialized");
+  
+  // Barometric pressure sensor
+  if (!bmp.begin()) {
+    Serial.println("WARNING: BMP085 not found!");
+  } else {
+    Serial.println("BMP085 initialized");
   }
-  // Check if the RTC lost power and if so, set the time:
-  if (rtc.lostPower()) {
-    Serial.println("RTC lost power, lets set the time!");
-    // The following line sets the RTC to the date & time this sketch was compiled:
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    // This line sets the RTC with an explicit date & time, for example to set
-    // January 21, 2014 at 3am you would call:
-    //rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
-  }
-
-  // Set the display brightness (0-7):
-  display.setBrightness(5);
-  // Clear the display:
-  display.clear();
-
-
-
 }
 
-
-void loop() {
-  if (counter >= 5)
-  {
-    counter = 0;
+// ==================== BUTTON HANDLING ====================
+void handleButton() {
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  
+  // Debouncing logic
+  if (currentButtonState == HIGH && lastButtonState == LOW && buttonTimer >= BUTTON_DEBOUNCE_MS) {
+    buttonPressed = true;
+    buttonTimer = 0;
   }
-  //-----------------GUZIK--------------------------------
-  if (buttonms > 750 && digitalRead(buttonPin) == HIGH)
-  {
-    delay(250);
-    counter++;
+  
+  lastButtonState = currentButtonState;
+  
+  // Process button press
+  if (buttonPressed) {
+    displayMode++;
+    if (displayMode >= MODE_COUNT) {
+      displayMode = MODE_PARTICLES;
+    }
     lcd.clear();
+    buttonPressed = false;
+    Serial.print("Display mode changed to: ");
+    Serial.println(displayMode);
   }
-  //-----------------KONRTOKLI--------------------------------
-  if (staty> 500)
-  {
-  if (srparticles >= 180) {
+}
+
+// ==================== SENSOR UPDATES ====================
+void updateSensors() {
+  sensors_event_t event;
+  
+  // Temperature
+  dht.temperature().getEvent(&event);
+  if (!isnan(event.temperature)) {
+    sensorData.temperature = validateTemperature(event.temperature);
+    Serial.print("Temperature: ");
+    Serial.print(sensorData.temperature);
+    Serial.println(" C");
+  }
+  
+  // Humidity
+  dht.humidity().getEvent(&event);
+  if (!isnan(event.relative_humidity)) {
+    sensorData.humidity = validateHumidity(event.relative_humidity);
+    Serial.print("Humidity: ");
+    Serial.print(sensorData.humidity);
+    Serial.println(" %");
+  }
+  
+  // Pressure
+  bmp.getEvent(&event);
+  if (event.pressure) {
+    sensorData.pressure = validatePressure(event.pressure);
+    Serial.print("Pressure: ");
+    Serial.print(sensorData.pressure);
+    Serial.println(" hPa");
+  }
+  
+  // Dust particles
+  sensorData.particles = dustSensor.getDustDensity();
+  sensorData.avgParticles = dustSensor.getRunningAverage();
+  Serial.print("Particles: ");
+  Serial.print(sensorData.particles);
+  Serial.print(" ug/m3 (avg: ");
+  Serial.print(sensorData.avgParticles);
+  Serial.println(" ug/m3)");
+  
+  // CO2/Vapor concentration (note: needs proper calibration for your sensor)
+  sensorData.vaporConcentration = analogRead(CO2_ANALOG_PIN);
+  Serial.print("Vapor/CO2: ");
+  Serial.print(sensorData.vaporConcentration);
+  Serial.println(" (raw ADC)");
+  
+  Serial.println("-----------------------------------");
+  sensorData.valid = true;
+}
+
+// ==================== AIR QUALITY INDICATORS ====================
+void updateAirQualityIndicators() {
+  int avg = sensorData.avgParticles;
+  
+  if (avg >= AQ_POOR) {
+    // Very Poor - Red
     leds[0] = CRGB(255, 0, 0);
     FastLED.show();
     servo.write(0);
-    RGB_color(255, 0, 0);
+    setRGBColor(255, 0, 0);
   }
-  else if (srparticles >= 130) {
+  else if (avg >= AQ_MODERATE) {
+    // Poor - Cyan
     leds[0] = CRGB(0, 255, 255);
     FastLED.show();
     servo.write(50);
-    RGB_color(0, 255, 255);
+    setRGBColor(0, 255, 255);
   }
-  else if (srparticles >= 70) {
+  else if (avg >= AQ_GOOD) {
+    // Moderate - Blue
     leds[0] = CRGB(0, 0, 255);
     FastLED.show();
     servo.write(100);
-    RGB_color(0, 0, 255);
+    setRGBColor(0, 0, 255);
   }
-  else if (srparticles >= 25) {
+  else if (avg >= AQ_EXCELLENT) {
+    // Good - Yellow-Green
     leds[0] = CRGB(150, 255, 0);
     FastLED.show();
     servo.write(140);
-    RGB_color(0, 255, 0);
+    setRGBColor(0, 255, 0);
   }
   else {
+    // Excellent - Green
     leds[0] = CRGB(0, 255, 0);
     FastLED.show();
     servo.write(180);
-    RGB_color(0, 0, 0);
+    setRGBColor(0, 0, 0);
   }
-  staty=0;
+}
+
+// ==================== LCD DISPLAY ====================
+void updateLCD() {
+  if (!sensorData.valid) {
+    lcd.setCursor(0, 1);
+    lcd.print("Waiting for data...");
+    return;
   }
-  particles = dustSensor.getDustDensity();
-  srparticles = dustSensor.getRunningAverage();
-  if (sensors > 1000)
-  {
-    //------------------bar-------------
-    /* Get a new sensor event */
-    sensors_event_t event;
-    bmp.getEvent(&event);
-    /* Display the results (barometric pressure is measure in hPa) */
-    if (event.pressure)
-    {
-      pressure = event.pressure;
-      Serial.print("Pressure:"); Serial.print(event.pressure); Serial.println(" hPa");
-      float seaLevelPressure = SENSORS_PRESSURE_SEALEVELHPA;
-      Serial.print("Altitude:    ");
-      Serial.print(bmp.pressureToAltitude(seaLevelPressure, event.pressure));
-
-    }
-    //-----------------DHT--------------------
-    // Get temperature event and print its value.
-    dht.temperature().getEvent(&event);
-    if (event.temperature) {
-      temp = event.temperature;
-      Serial.print(F("Temperature: ")); Serial.print(event.temperature); Serial.println(F("°C"));
-
-    }
-    // Get humidity event and print its value.
-    dht.humidity().getEvent(&event);
-    if (event.relative_humidity) {
-      humidity = event.relative_humidity;
-      Serial.print(F("Humidity: ")); Serial.print(event.relative_humidity); Serial.println(F("%"));
-
-    }
-    //----------------CO2-------------------
-    sensorValue = analogRead(0);       // read analog input pin 0
-    opary = sensorValue;
-    Serial.print("Co2="); Serial.print(sensorValue, DEC); Serial.println(" PPM");
-
-    //-----------------DUST--------------------------
-    Serial.print("Dust density: ");
-    Serial.print(dustSensor.getDustDensity());
-
-    Serial.print(" ug/m3; Running average: ");
-    Serial.print(dustSensor.getRunningAverage());
-    Serial.println(" ug/m3");
-    Serial.println("-------------------------------------------------------------");
-    sensors = 0;              // reset the counter to 0 so the counting starts over...
-  }
-
-  if (counter == 1)
-  {
-    if (lcdms > 500) {
-      lcd.setCursor(4, 1); lcd.print("Temperatura:");
-      lcd.setCursor(7, 2); lcd.print(temp + String("C  "));
-      lcdms = 0;
-    }
-  }
-  if (counter == 2)
-  {
-    if (lcdms > 500) {
-      lcd.setCursor(4, 1); lcd.print("Wilgotnosc:");
-      lcd.setCursor(7, 2); lcd.print(humidity + String("%  "));
-      lcdms = 0;
-    }
-  }
-
-  if (counter == 3)
-  {
-    if (lcdms > 500) {
-      lcd.setCursor(5, 1); lcd.print("Cisnienie:");
-      lcd.setCursor(6, 2); lcd.print(pressure + String("hPa  "));
-      lcdms = 0;
-    }
-  }
-  if (counter == 4)
-  {
-    if (lcdms > 500) {
-      lcd.setCursor(2, 1); lcd.print("Stezenie oparow:");
-      lcd.setCursor(7, 2); lcd.print(opary + String("PPM  "));
-      lcdms = 0;
-    }
-  }
-  if (counter == 0)
-  {
-    if (lcdms > 500) {
-      lcd.setCursor(3, 0); lcd.print("Czastki stale:");
-      lcd.setCursor(3, 1); lcd.print(String("Teraz ") + particles + String("ug/m3  "));
-      lcd.setCursor(3, 2); lcd.print(String("Srednia ") + srparticles + String("ug/m3  "));
-      if (srparticles >= 180) {
-        lcd.setCursor(0, 3); lcd.print("B.Zla j. powietrza  ");
-      }
-      else if (srparticles >= 130) {
-        lcd.setCursor(0, 3); lcd.print("Zla j. powietrza    ");
-      }
-      else if (srparticles >= 70) {
-        lcd.setCursor(0, 3); lcd.print("Srednia j. powietrza ");
-      }
-      else if (srparticles >= 25) {
-        lcd.setCursor(0, 3); lcd.print("Dobra j. powietrza  ");
-      }
-      else {
-        lcd.setCursor(0, 3); lcd.print("B.Dobra j. powietrza ");
-      }
-      lcdms = 0;
-
-    }
-  }
-
-
-// Get current date and time
-  DateTime now = rtc.now();
-
-  // Create time format to display:
-  int displaytime = (now.hour() * 100) + now.minute();
-
-  // Print displaytime to the Serial Monitor
-  Serial.println(displaytime);
-
-  // Display the current time in 24 hour format with leading zeros enabled and a center colon:
-  display.showNumberDecEx(displaytime, 0b11100000, true);
-
-  // Remove the following lines of code if   you want a static instead of a blinking center colon:
- 
-
-   // Prints displaytime without center colon.
-
   
-
-
-
+  char buffer[21]; // 20 chars + null terminator
+  
+  switch (displayMode) {
+    case MODE_PARTICLES:
+      lcd.setCursor(3, 0);
+      lcd.print("Particles (PM2.5)");
+      
+      lcd.setCursor(3, 1);
+      snprintf(buffer, sizeof(buffer), "Now: %d ug/m3   ", sensorData.particles);
+      lcd.print(buffer);
+      
+      lcd.setCursor(3, 2);
+      snprintf(buffer, sizeof(buffer), "Avg: %d ug/m3   ", sensorData.avgParticles);
+      lcd.print(buffer);
+      
+      lcd.setCursor(0, 3);
+      lcd.print(getAirQualityText(sensorData.avgParticles));
+      break;
+      
+    case MODE_TEMPERATURE:
+      lcd.setCursor(4, 1);
+      lcd.print("Temperature:");
+      lcd.setCursor(7, 2);
+      snprintf(buffer, sizeof(buffer), "%.1f C   ", sensorData.temperature);
+      lcd.print(buffer);
+      break;
+      
+    case MODE_HUMIDITY:
+      lcd.setCursor(4, 1);
+      lcd.print("Humidity:");
+      lcd.setCursor(7, 2);
+      snprintf(buffer, sizeof(buffer), "%.1f %%   ", sensorData.humidity);
+      lcd.print(buffer);
+      break;
+      
+    case MODE_PRESSURE:
+      lcd.setCursor(5, 1);
+      lcd.print("Pressure:");
+      lcd.setCursor(6, 2);
+      snprintf(buffer, sizeof(buffer), "%.0f hPa   ", sensorData.pressure);
+      lcd.print(buffer);
+      break;
+      
+    case MODE_VAPOR:
+      lcd.setCursor(2, 1);
+      lcd.print("Vapor/Gas Conc.:");
+      lcd.setCursor(7, 2);
+      snprintf(buffer, sizeof(buffer), "%d (raw)   ", sensorData.vaporConcentration);
+      lcd.print(buffer);
+      break;
+  }
 }
 
-void RGB_color(int red_light_value, int green_light_value, int blue_light_value)
- {
-  analogWrite(red_light_pin, red_light_value);
-  analogWrite(green_light_pin, green_light_value);
-  analogWrite(blue_light_pin, blue_light_value);
+// ==================== TIME DISPLAY ====================
+void updateTimeDisplay() {
+  DateTime now = rtc.now();
+  int displayTime = (now.hour() * 100) + now.minute();
+  display.showNumberDecEx(displayTime, 0b11100000, true);
 }
 
+// ==================== HELPER FUNCTIONS ====================
+void setRGBColor(int red, int green, int blue) {
+  analogWrite(RED_PIN, red);
+  analogWrite(GREEN_PIN, green);
+  analogWrite(BLUE_PIN, blue);
+}
+
+float validateTemperature(float temp) {
+  if (temp < TEMP_MIN || temp > TEMP_MAX) {
+    Serial.println("WARNING: Temperature out of range!");
+    return 0.0;
+  }
+  return temp;
+}
+
+float validateHumidity(float humidity) {
+  if (humidity < HUMIDITY_MIN || humidity > HUMIDITY_MAX) {
+    Serial.println("WARNING: Humidity out of range!");
+    return 0.0;
+  }
+  return humidity;
+}
+
+float validatePressure(float pressure) {
+  if (pressure < PRESSURE_MIN || pressure > PRESSURE_MAX) {
+    Serial.println("WARNING: Pressure out of range!");
+    return 0.0;
+  }
+  return pressure;
+}
+
+const char* getAirQualityText(int particles) {
+  if (particles >= AQ_POOR) {
+    return "Very Poor Quality   ";
+  } else if (particles >= AQ_MODERATE) {
+    return "Poor Quality        ";
+  } else if (particles >= AQ_GOOD) {
+    return "Moderate Quality    ";
+  } else if (particles >= AQ_EXCELLENT) {
+    return "Good Quality        ";
+  } else {
+    return "Excellent Quality   ";
+  }
+}
